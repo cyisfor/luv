@@ -1,6 +1,7 @@
 #ifndef LIB_LUV_FUNCTIONS
 #define LIB_LUV_FUNCTIONS
 #include "common.h"
+#include "buffer.h"
 
 #ifndef LUA_OK
 #define LUA_OK 0
@@ -730,9 +731,8 @@ static int luv_timer_get_repeat(lua_State* L) {
 
 static void luv_on_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
     luv_handle_t* lhandle = handle->data;
-    if(lhandle->buf.base == NULL) {
-        lhandle->buf.base = malloc(suggested_size);
-        lhandle->buf.len = suggested_size;
+    if(lhandle->bufref == LUA_NOREF) {
+        lhandle->bufref = buffer_prepare(lhandle->L, suggested_size, &lhandle->buf);
     }
     buf->base = lhandle->buf.base;
     buf->len = lhandle->buf.len;
@@ -740,13 +740,19 @@ static void luv_on_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* b
 
 static void luv_on_read(uv_stream_t* handle, ssize_t nread, const uv_buf_t* buf) {
   lua_State* L = luv_prepare_event(handle->data);
+  luv_handle_t* lhandle = handle->data;
 #ifdef LUV_STACK_CHECK
   int top = lua_gettop(L) - 1;
 #endif
   if (nread >= 0) {
 
     if (luv_get_callback(L, "ondata")) {
-      lua_pushlstring (L, buf->base, nread);
+        lua_rawgeti(L, LUA_REGISTRYINDEX, lhandle->bufref);
+        if(nread != buf->len) {
+            lua_pushinteger(L, 0);
+            lua_pushinteger(L, nread);
+            buffer_slice (L);
+        }
       luv_call(L, 2, 0);
     }
   } else {
@@ -757,7 +763,7 @@ static void luv_on_read(uv_stream_t* handle, ssize_t nread, const uv_buf_t* buf)
     } else if (nread != UV_ECONNRESET) {
       uv_close((uv_handle_t*)handle, NULL);
       /* TODO: route reset events somewhere so the user knows about them */
-      fprintf(stderr, "TODO: Implement async error handling\n");
+      fprintf(stderr, "TODO: Implement async error handling %s\n",uv_strerror(nread));
       assert(0);
     }
   }
@@ -892,7 +898,7 @@ static int luv_write(lua_State* L) {
 
   lreq->lhandle = handle->data;
 
-  // Reference the string in the registry
+  // Reference the buffer in the registry
   lua_pushvalue(L, 2);
   lreq->data_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
@@ -908,20 +914,19 @@ static int luv_write(lua_State* L) {
     uv_buf_t* bufs = malloc(sizeof(uv_buf_t) * length);
     for (i = 0; i < length; i++) {
       lua_rawgeti(L, 2, i + 1);
-      size_t len;
-      const char* chunk = luaL_checklstring(L, -1, &len);
-      bufs[i] = uv_buf_init((char*)chunk, len);
-      lua_pop(L, 1);
+      buffer_get(L, -1, bufs + i);
     }
+    lua_pop(L, length);
+
     uv_write(req, handle, bufs, length, luv_after_write);
     /* TODO: find out if it's safe to free this soon */
     free(bufs);
   }
   else {
-    size_t len;
-    const char* chunk = luaL_checklstring(L, 2, &len);
-    uv_buf_t buf = uv_buf_init((char*)chunk, len);
+    uv_buf_t buf;
+    buffer_get(L, 2, &buf);
     uv_write(req, handle, &buf, 1, luv_after_write);
+    lua_pop(L, 1);
   }
 #ifdef LUV_STACK_CHECK
   assertEqual(lua_gettop(L),top);
@@ -1775,8 +1780,13 @@ static int push_fs_result(lua_State* L, uv_fs_t* req) {
     case UV_FS_OPEN:
     case UV_FS_SENDFILE:
     case UV_FS_WRITE:
-      lua_pushinteger(L, req->result);
-      return 1;
+      {
+          int bufref = (int) (long) req->ptr;
+          //lua_rawgeti(L, LUA_REGISTRYINDEX, bufref); not using this at all? hm...
+          luaL_unref(L, LUA_REGISTRYINDEX, bufref);
+          lua_pushinteger(L, req->result);
+          return 1;
+      }
 
     case UV_FS_STAT:
     case UV_FS_LSTAT:
@@ -1789,8 +1799,16 @@ static int push_fs_result(lua_State* L, uv_fs_t* req) {
       return 1;
 
     case UV_FS_READ:
-      lua_pushlstring(L, req->ptr, req->result);
-      return 1;
+      {
+          int bufref = (int) (long) req->ptr;
+          lua_rawgeti(L, LUA_REGISTRYINDEX, bufref);
+          luaL_unref(L, LUA_REGISTRYINDEX, bufref);
+          lua_pushinteger(L, 0);
+          lua_pushinteger(L, req->result);
+          buffer_slice(L);
+          lua_remove(L, -2);
+          return 1;
+      }
 
     case UV_FS_READDIR:
       {
@@ -1847,11 +1865,11 @@ static void on_fs(uv_fs_t *req) {
     argc = 1 + push_fs_result(L, req);
   }
 
+  luv_call(L, argc, 0);
+
   // Cleanup the req
   uv_fs_req_cleanup(req);
   free(req);
-
-  luv_call(L, argc, 0);
 }
 
 #define FS_CALL(func, index, ...)                                              \
@@ -1885,16 +1903,17 @@ static void on_fs(uv_fs_t *req) {
 // HACK: Hacked version that patches req->ptr to hold buffer
 // TODO: get this into libuv itself, there is no reason it couldn't store this
 // for us.
-#define FS_CALL2(func, index, ...)                                             \
+#define FS_CALL2(func, index, file, buffer, offset)                                             \
   uv_fs_t* req = malloc(sizeof(*req));                                         \
+  int bufref = luaL_ref(L, LUA_REGISTRYINDEX);                                 \
   if (lua_isnone(L, index)) {                                                  \
-    if (uv_fs_##func(uv_default_loop(), req, __VA_ARGS__, NULL) < 0) {         \
+    if (uv_fs_##func(uv_default_loop(), req, file, buffer, 1, offset, NULL) < 0) {         \
       push_fs_error(L, req);                                                   \
       uv_fs_req_cleanup(req);                                                  \
       free(req);                                                               \
       return lua_error(L);                                                     \
     }                                                                          \
-    req->ptr = buffer;                                              /* HACK */ \
+    req->ptr = (void*)(long)bufref;                                              /* HACK */ \
     int argc = push_fs_result(L, req);                                         \
     uv_fs_req_cleanup(req);                                                    \
     free(req);                                                                 \
@@ -1906,15 +1925,14 @@ static void on_fs(uv_fs_t *req) {
   lua_pushvalue(L, index);                                                     \
   callback->ref = luaL_ref(L, LUA_REGISTRYINDEX);                              \
   req->data = (void*)callback;                                                 \
-  if (uv_fs_##func(uv_default_loop(), req, __VA_ARGS__, on_fs) < 0) {          \
+  if (uv_fs_##func(uv_default_loop(), req, file, buffer, 1, offset, on_fs) < 0) {          \
     push_fs_error(L, req);                                                     \
     uv_fs_req_cleanup(req);                                                    \
     free(req);                                                                 \
     return lua_error(L);                                                       \
   }                                                                            \
-  req->ptr = buffer;                                                /* HACK */ \
+  req->ptr = (void*)(long) bufref;                                                /* HACK */ \
   return 0;                                                                    \
-
 
 static int luv_fs_open(lua_State* L) {
   const char* path = luaL_checkstring(L, 1);
@@ -1935,25 +1953,20 @@ static int luv_fs_read(lua_State* L) {
   if (!lua_isnil(L, 3)) {
     offset = luaL_checkint(L, 3);
   }
-  uv_buf_t* buffer = malloc(sizeof(*buffer));
-  buffer->base = malloc(length + 1);
-  buffer->len = length;
-  FS_CALL2(read, 4, file, buffer, 1, offset);
+  uv_buf_t* buffer = buffer_new(L,length);
+  FS_CALL2(read, 4, file, buffer, offset);
 }
 
 static int luv_fs_write(lua_State* L) {
   uv_file file = luaL_checkint(L, 1);
-  size_t length;
-  const char* string = luaL_checklstring(L, 2, &length);
-  uv_buf_t* buffer = malloc(length + 1 + sizeof(*buffer));
-  buffer->base = (void*)buffer + sizeof(*buffer);
-  buffer->len = length;
-  memcpy(buffer->base, string, length);
+  uv_buf_t buffer;
+  buffer_get(L, 2, &buffer);
+
   off_t offset = -1;
   if (!lua_isnil(L, 3)) {
     offset = luaL_checkint(L, 3);
   }
-  FS_CALL2(write, 4, file, buffer, 1, offset);
+  FS_CALL2(write, 4, file, &buffer, offset);
 }
 
 static int luv_fs_unlink(lua_State* L) {

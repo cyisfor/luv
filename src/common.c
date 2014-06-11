@@ -2,6 +2,8 @@
 #include <assert.h>
 #include "common.h"
 
+typedef void (*finalizer_t)(void*);
+
 /* Initialize a new lhandle and push the new userdata on the stack. */
 static luv_handle_t* luv_handle_create(lua_State* L, size_t size, int mask) {
 
@@ -133,8 +135,9 @@ void luv_handle_unref(lua_State* L, luv_handle_t* lhandle) {
     }
     lhandle->ref = LUA_NOREF;
 
-    if(lhandle->buf.base) {
-        puts("freebase");
+    if(lhandle->bufref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, lhandle->bufref);
+        lhandle->bufref = LUA_NOREF;
         free(lhandle->buf.base);
         lhandle->buf.base = NULL;
         lhandle->buf.len = 0;

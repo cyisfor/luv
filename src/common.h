@@ -61,6 +61,7 @@ typedef struct {
   int ref;             /* ref is null when refCount is 0 meaning we're weak */
   int mask;
   uv_buf_t buf;
+  int bufref;
 } luv_handle_t;
 
 typedef struct {
