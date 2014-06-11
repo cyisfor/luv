@@ -60,6 +60,7 @@ typedef struct {
   int threadref;       /* hold reference to coroutine if created in one */
   int ref;             /* ref is null when refCount is 0 meaning we're weak */
   int mask;
+  uv_buf_t buf;
 } luv_handle_t;
 
 typedef struct {

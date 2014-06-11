@@ -729,8 +729,13 @@ static int luv_timer_get_repeat(lua_State* L) {
 /******************************************************************************/
 
 static void luv_on_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
-  buf->base = malloc(suggested_size);
-  buf->len = suggested_size;
+    luv_handle_t* lhandle = handle->data;
+    if(lhandle->buf.base == NULL) {
+        lhandle->buf.base = malloc(suggested_size);
+        lhandle->buf.len = suggested_size;
+    }
+    buf->base = lhandle->buf.base;
+    buf->len = lhandle->buf.len;
 }
 
 static void luv_on_read(uv_stream_t* handle, ssize_t nread, const uv_buf_t* buf) {
@@ -757,7 +762,6 @@ static void luv_on_read(uv_stream_t* handle, ssize_t nread, const uv_buf_t* buf)
     }
   }
 
-  free(buf->base);
 #ifdef LUV_STACK_CHECK
   assertEqual(lua_gettop(L),top);
 #endif
@@ -1047,11 +1051,14 @@ static void on_bind_addrinfo(uv_getaddrinfo_t* req, int status, struct addrinfo*
             if(good == 0) // skip
                 continue;
         }
-        
+     
+        errno = 0;
         if((err = uv_tcp_bind(handle,curr->ai_addr,0)) < 0) {
             /* don't raise an exception here, because we might be able to
              * bind to the other addresses
              */
+            char aoeu[0x100];
+            uv_ip4_name((struct sockaddr_in*)curr->ai_addr,aoeu,0x100);
             lua_pushvalue(L,-1); // on_bound
             lua_pushboolean(L, 0); // not bound
             push_addrinfo(L, curr); // address chosen
@@ -1258,7 +1265,7 @@ static int luv_tcp_connect(lua_State* L) {
   hints.ai_family = AF_UNSPEC;
 
   luv_req_t* lreq = malloc(sizeof(*lreq));
-  lreq->lhandle = handle->data; // = L ?
+  lreq->lhandle = handle->data; // L = lhandle->L ?
 
   lua_pushvalue(L, 1); // handle
   lreq->data_ref = luaL_ref(L, LUA_REGISTRYINDEX);

@@ -32,6 +32,9 @@ static luv_handle_t* luv_handle_create(lua_State* L, size_t size, int mask) {
     lhandle->threadref = luaL_ref(L, LUA_REGISTRYINDEX);
   }
 
+  lhandle->buf.base = NULL;
+  lhandle->buf.len = 0;
+
   return lhandle;
 }
 
@@ -129,6 +132,13 @@ void luv_handle_unref(lua_State* L, luv_handle_t* lhandle) {
       lhandle->threadref = LUA_NOREF;
     }
     lhandle->ref = LUA_NOREF;
+
+    if(lhandle->buf.base) {
+        puts("freebase");
+        free(lhandle->buf.base);
+        lhandle->buf.base = NULL;
+        lhandle->buf.len = 0;
+    }
 //    printf("makeWeak\t%d lhandle=%p handle=%p\n", lhandle->mask, lhandle, lhandle->handle);
   }
 }
